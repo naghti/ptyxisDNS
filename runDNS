@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Per-process Smart DNS hosts overrides; never edits system configuration."""
+import ipaddress
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+BASE = Path(__file__).resolve().parent
+CACHE = BASE / 'redirects.hosts'
+OVERRIDES = BASE / 'overrides.hosts'
+SOURCE = 'https://raw.githubusercontent.com/Internet-Helper/GeoHideDNS/refs/heads/main/hosts/eu/hosts'
+
+
+def parse(text):
+    result = {}
+    for line in text.splitlines():
+        parts = line.split('#', 1)[0].split()
+        if len(parts) < 2:
+            continue
+        try:
+            ip = ipaddress.ip_address(parts[0])
+        except ValueError:
+            continue
+        if not ip.is_global:
+            continue
+        for domain in parts[1:]:
+            domain = domain.lower().rstrip('.')
+            if re.fullmatch(r'[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?', domain) and '.' in domain:
+                result.setdefault(domain, str(ip))
+    return result
+
+
+def update():
+    response = subprocess.run(['curl', '--fail', '--silent', '--show-error', '--location',
+                               '--proto', '=https', '--proto-redir', '=https', '--max-time', '45', SOURCE],
+                              capture_output=True, text=True)
+    if response.returncode:
+        raise RuntimeError('Не удалось обновить список: ' + response.stderr.strip())
+    routes = parse(response.stdout)
+    if 'chatgpt.com' not in routes or len(routes) < 20:
+        raise RuntimeError('Некорректный список: старый файл сохранён.')
+    with tempfile.NamedTemporaryFile(mode='w', dir=BASE, delete=False) as out:
+        out.write('# Source: ' + SOURCE + '\n')
+        out.writelines(f'{ip} {name}\n' for name, ip in routes.items())
+    os.replace(out.name, CACHE)
+    print(f'Обновлено перенаправлений: {len(routes)}')
+
+
+def launch(command, interface=None):
+    if not shutil.which('bwrap'):
+        raise RuntimeError('Нужен установленный bubblewrap (bwrap).')
+    if not CACHE.exists():
+        update()
+    routes = parse(CACHE.read_text())
+    if OVERRIDES.exists():
+        routes.update(parse(OVERRIDES.read_text()))
+    if not routes:
+        raise RuntimeError('Список перенаправлений пуст.')
+    # Preserve host-specific aliases except names explicitly overridden here.
+    lines = []
+    for line in Path('/etc/hosts').read_text().splitlines():
+        parts = line.split('#', 1)[0].split()
+        if len(parts) >= 2:
+            names = [n for n in parts[1:] if n.lower().rstrip('.') not in routes]
+            if names:
+                lines.append(parts[0] + ' ' + ' '.join(names))
+        else:
+            lines.append(line)
+    lines.extend(f'{ip} {name}' for name, ip in routes.items())
+    nss = Path('/etc/nsswitch.conf').read_text()
+    nss = re.sub(r'^hosts:.*$', 'hosts: files dns', nss, flags=re.M)
+    with tempfile.TemporaryDirectory(prefix='terminal-dns-') as directory:
+        hosts = Path(directory) / 'hosts'
+        hosts.write_text('\n'.join(lines) + '\n')
+        switch = Path(directory) / 'nsswitch.conf'
+        switch.write_text(nss)
+        args = ['bwrap', '--dev-bind', '/', '/', '--ro-bind', str(hosts), '/etc/hosts',
+                '--ro-bind', str(switch), '/etc/nsswitch.conf',
+                '--setenv', 'TERMINAL_DNS_ACTIVE', 'geohide', '--',
+                sys.executable, str(BASE / 'relay.py')]
+        if interface:
+            args += ['--interface', interface]
+        args += ['--'] + command
+        return subprocess.call(args)
+
+
+def main():
+    args = sys.argv[1:]
+    interface = None
+    if args[:1] == ['--interface']:
+        if len(args) < 2:
+            raise RuntimeError('Использование: runDNS --interface INTERFACE [--] COMMAND')
+        interface, args = args[1], args[2:]
+    if args == ['--help']:
+        print('runDNS [--] COMMAND [ARGS...]\nrunDNS --update\nrunDNS --check\nrunDNS --diagnose\nrunDNS [--interface INTERFACE] --test-codex\nrunDNS --interface INTERFACE -- COMMAND [ARGS...]\nrunDNS --check-direct INTERFACE\nrunDNS --diagnose-direct INTERFACE\nБез команды: интерактивная оболочка. Системные DNS/hosts не меняются.')
+        return 0
+    if args == ['--update']:
+        update()
+        return 0
+    if args == ['--test-codex']:
+        return launch([sys.executable, str(BASE / 'test_codex.py')], interface)
+    if args[:1] in (['--check-direct'], ['--diagnose-direct']):
+        if len(args) != 2:
+            raise RuntimeError('Укажи физический интерфейс, например enp6s0.')
+        return launch([sys.executable, str(BASE / 'check.py'), args[0].replace('-direct', ''), '--interface', args[1]])
+    if args in (['--check'], ['--diagnose']):
+        return launch([sys.executable, str(BASE / 'check.py')] + args)
+    if args[:1] == ['--']:
+        args = args[1:]
+    return launch(args or [os.environ.get('SHELL', '/bin/bash'), '-i'], interface)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (RuntimeError, OSError) as error:
+        print('runDNS: ' + str(error), file=sys.stderr)
+        sys.exit(1)

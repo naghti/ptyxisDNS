@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Keep Codex in this window instead of using an outside shared daemon."""
+import os
+import sys
+binary = os.environ.get('TERMINAL_DNS_CODEX_BINARY')
+if not binary:
+    sys.exit('runDNS: исходный codex не найден; перезапусти DNS-окно после установки Codex.')
+args = sys.argv[1:]
+if '--no-daemon' not in args:
+    args.insert(0, '--no-daemon')
+os.execv(binary, [binary] + args)

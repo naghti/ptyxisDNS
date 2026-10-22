@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+
+# Generated or machine-specific routing data
+/redirects.hosts
+/overrides.hosts
+/verification.txt
